@@ -182,7 +182,15 @@ func see(ctx context.Context, wg *sync.WaitGroup, filterPtr string, filePathPtr 
 	if tailPtr {
 		fmt.Println("Entering tail mode (Ctrl+C to stop)...")
 
-		var lastSize int64
+		file, err := os.Open(filePathPtr)
+		if err != nil {
+			log.Fatalf("Error opening file: %v", err)
+		}
+		defer file.Close()
+
+		// Start from EOF
+		pos, _ := file.Seek(0, io.SeekEnd)
+		reader := bufio.NewReader(file)
 
 		for {
 			select {
@@ -190,49 +198,42 @@ func see(ctx context.Context, wg *sync.WaitGroup, filterPtr string, filePathPtr 
 				fmt.Println("\nShutting down see")
 				return
 			default:
-				// Check file status
-				info, err := os.Stat(filePathPtr)
+				line, err := reader.ReadString('\n')
 				if err != nil {
-					log.Printf("Error stat file: %v", err)
+					if err == io.EOF {
+						// Wait for writer to append new data
+						time.Sleep(200 * time.Millisecond)
+
+						// Check if file grew or was rotated
+						info, serr := os.Stat(filePathPtr)
+						if serr != nil {
+							time.Sleep(1 * time.Second)
+							continue
+						}
+						if info.Size() < pos {
+							// File was truncated / rotated
+							file.Close()
+							file, err = os.Open(filePathPtr)
+							if err != nil {
+								log.Printf("Error reopening file after rotation: %v", err)
+								time.Sleep(1 * time.Second)
+								continue
+							}
+							reader = bufio.NewReader(file)
+							pos = 0
+						}
+						continue
+					}
+					log.Printf("Read error: %v", err)
 					time.Sleep(1 * time.Second)
 					continue
 				}
 
-				// If the file shrank, assume it was truncated or rotated
-				if info.Size() < lastSize {
-					lastSize = 0
+				// normal line
+				pos += int64(len(line))
+				if filterRegex == nil || filterRegex.MatchString(line) {
+					fmt.Print(line)
 				}
-
-				// File grew? read new bytes
-				if info.Size() > lastSize {
-					f, err := os.Open(filePathPtr)
-					if err != nil {
-						log.Printf("Error reopening file: %v", err)
-						time.Sleep(1 * time.Second)
-						continue
-					}
-
-					// Jump to last read position
-					f.Seek(lastSize, io.SeekStart)
-					reader := bufio.NewReader(f)
-
-					for {
-						line, err := reader.ReadString('\n')
-						if err != nil {
-							break // EOF for now
-						}
-						if filterRegex == nil || filterRegex.MatchString(line) {
-							fmt.Print(line)
-						}
-					}
-
-					// Remember where we left off
-					pos, _ := f.Seek(0, io.SeekCurrent)
-					lastSize = pos
-					f.Close()
-				}
-
-				time.Sleep(500 * time.Millisecond)
 			}
 		}
 	}
