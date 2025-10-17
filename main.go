@@ -86,12 +86,20 @@ Filter supports basic regular expressions:
 	filterPtr := flag.String("filter", "", "Optional regex or string literal to filter lines")
 	tailPtr := flag.Bool("t", false, "Optional -t to tail the file")
 	flag.Parse()
+
 	if *versionFlag {
 		fmt.Printf("see version %s (built %s)\n", version, buildDate)
 		return
 	}
 
 	args := flag.Args()
+
+	// Detect -t when passed as positional at the end (e.g. see file "filter" -t)
+	for _, a := range args {
+		if a == "-t" || a == "--t" {
+			*tailPtr = true
+		}
+	}
 
 	// validate input
 	if *filePathPtr == "" {
@@ -172,32 +180,41 @@ func see(ctx context.Context, wg *sync.WaitGroup, filterPtr string, filePathPtr 
 	}
 
 	if tailPtr {
-		file.Close()
+		fmt.Println("Entering tail mode (Ctrl+C to stop)...")
 		f, err := os.Open(filePathPtr)
 		if err != nil {
 			log.Fatalf("Error reopening file: %v", err)
 		}
 		defer f.Close()
-		f.Seek(0, io.SeekEnd) // move to end if you want only new lines
-		tailScanner := bufio.NewScanner(f)
+
+		// Start at EOF so we only get new lines
+		offset, _ := f.Seek(0, io.SeekEnd)
+		reader := bufio.NewReader(f)
 
 		for {
 			select {
 			case <-ctx.Done():
-				fmt.Println("Shutting down see")
+				fmt.Println("\nShutting down see")
 				return
 			default:
-				if tailScanner.Scan() {
-					line := tailScanner.Text()
-					if filterRegex == nil || filterRegex.MatchString(line) {
-						fmt.Println(line)
+				line, err := reader.ReadString('\n')
+				if err != nil {
+					if err == io.EOF {
+						time.Sleep(200 * time.Millisecond)
+						// In case file grew, re-seek
+						newOffset, _ := f.Seek(0, io.SeekCurrent)
+						if newOffset < offset {
+							// File was truncated or rotated
+							f.Seek(0, io.SeekStart)
+						}
+						continue
 					}
-				} else {
-					if err := tailScanner.Err(); err != nil {
-						log.Printf("Error reading file: %v", err)
-						return // stop the goroutine and return to main
-					}
-					time.Sleep(200 * time.Millisecond) // wait and try again
+					log.Printf("Error reading file: %v", err)
+					return
+				}
+				offset += int64(len(line))
+				if filterRegex == nil || filterRegex.MatchString(line) {
+					fmt.Print(line)
 				}
 			}
 		}
