@@ -182,15 +182,16 @@ func see(ctx context.Context, wg *sync.WaitGroup, filterPtr string, filePathPtr 
 	if tailPtr {
 		fmt.Println("Entering tail mode (Ctrl+C to stop)...")
 
-		file, err := os.Open(filePathPtr)
+		// Start tailing from the end of what you already printed above.
+		info, err := os.Stat(filePathPtr)
 		if err != nil {
-			log.Fatalf("Error opening file: %v", err)
+			log.Fatalf("stat failed: %v", err)
 		}
-		defer file.Close()
+		lastSize := info.Size() // we already printed the file once
 
-		// Start from EOF
-		pos, _ := file.Seek(0, io.SeekEnd)
-		reader := bufio.NewReader(file)
+		// Buffer to accumulate chunks and handle partial lines at chunk edges
+		const chunkSize = 64 * 1024
+		var carry []byte
 
 		for {
 			select {
@@ -198,42 +199,83 @@ func see(ctx context.Context, wg *sync.WaitGroup, filterPtr string, filePathPtr 
 				fmt.Println("\nShutting down see")
 				return
 			default:
-				line, err := reader.ReadString('\n')
+				info, err := os.Stat(filePathPtr)
 				if err != nil {
-					if err == io.EOF {
-						// Wait for writer to append new data
-						time.Sleep(200 * time.Millisecond)
-
-						// Check if file grew or was rotated
-						info, serr := os.Stat(filePathPtr)
-						if serr != nil {
-							time.Sleep(1 * time.Second)
-							continue
-						}
-						if info.Size() < pos {
-							// File was truncated / rotated
-							file.Close()
-							file, err = os.Open(filePathPtr)
-							if err != nil {
-								log.Printf("Error reopening file after rotation: %v", err)
-								time.Sleep(1 * time.Second)
-								continue
-							}
-							reader = bufio.NewReader(file)
-							pos = 0
-						}
-						continue
-					}
-					log.Printf("Read error: %v", err)
-					time.Sleep(1 * time.Second)
+					log.Printf("stat error: %v", err)
+					time.Sleep(500 * time.Millisecond)
 					continue
 				}
 
-				// normal line
-				pos += int64(len(line))
-				if filterRegex == nil || filterRegex.MatchString(line) {
-					fmt.Print(line)
+				curSize := info.Size()
+
+				// Truncated or rotated (size shrank)
+				if curSize < lastSize {
+					lastSize = 0
+					carry = carry[:0]
 				}
+
+				// Grew: read exactly the new bytes [lastSize, curSize)
+				if curSize > lastSize {
+					f, err := os.Open(filePathPtr)
+					if err != nil {
+						log.Printf("open error: %v", err)
+						time.Sleep(500 * time.Millisecond)
+						continue
+					}
+
+					// Read in fixed-size chunks with ReadAt to avoid fd-position races
+					offset := lastSize
+					buf := make([]byte, chunkSize)
+
+					for offset < curSize {
+						// how much to read in this iteration
+						toRead := int64(len(buf))
+						remaining := curSize - offset
+						if remaining < toRead {
+							toRead = remaining
+						}
+
+						n, rerr := f.ReadAt(buf[:toRead], offset)
+						if n > 0 {
+							// Append to carry, then split by '\n'
+							carry = append(carry, buf[:n]...)
+							// Process complete lines
+							for {
+								idx := -1
+								for i := 0; i < len(carry); i++ {
+									if carry[i] == '\n' {
+										idx = i
+										break
+									}
+								}
+								if idx == -1 {
+									break
+								}
+								line := string(carry[:idx]) // without '\n'
+								carry = carry[idx+1:]
+
+								if filterRegex == nil || filterRegex.MatchString(line) {
+									fmt.Println(line)
+								}
+							}
+							offset += int64(n)
+						}
+						if rerr != nil {
+							// For regular files, ReadAt returns an error only at EOF or real errors.
+							if rerr != io.EOF {
+								log.Printf("read error: %v", rerr)
+							}
+							break
+						}
+					}
+					f.Close()
+
+					// Update lastSize to what we actually consumed
+					lastSize = curSize
+				}
+
+				// Polling interval; lower for snappier tailing
+				time.Sleep(200 * time.Millisecond)
 			}
 		}
 	}
