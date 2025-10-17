@@ -8,7 +8,7 @@ Save as `.gitignore`:
 # Binaries
 see
 see.exe
-
+*.zip
 # Build artifacts
 *.out
 *.exe
