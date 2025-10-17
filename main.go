@@ -181,15 +181,8 @@ func see(ctx context.Context, wg *sync.WaitGroup, filterPtr string, filePathPtr 
 
 	if tailPtr {
 		fmt.Println("Entering tail mode (Ctrl+C to stop)...")
-		f, err := os.Open(filePathPtr)
-		if err != nil {
-			log.Fatalf("Error reopening file: %v", err)
-		}
-		defer f.Close()
 
-		// Start at EOF so we only get new lines
-		offset, _ := f.Seek(0, io.SeekEnd)
-		reader := bufio.NewReader(f)
+		var lastSize int64
 
 		for {
 			select {
@@ -197,25 +190,49 @@ func see(ctx context.Context, wg *sync.WaitGroup, filterPtr string, filePathPtr 
 				fmt.Println("\nShutting down see")
 				return
 			default:
-				line, err := reader.ReadString('\n')
+				// Check file status
+				info, err := os.Stat(filePathPtr)
 				if err != nil {
-					if err == io.EOF {
-						time.Sleep(200 * time.Millisecond)
-						// In case file grew, re-seek
-						newOffset, _ := f.Seek(0, io.SeekCurrent)
-						if newOffset < offset {
-							// File was truncated or rotated
-							f.Seek(0, io.SeekStart)
-						}
+					log.Printf("Error stat file: %v", err)
+					time.Sleep(1 * time.Second)
+					continue
+				}
+
+				// If the file shrank, assume it was truncated or rotated
+				if info.Size() < lastSize {
+					lastSize = 0
+				}
+
+				// File grew? read new bytes
+				if info.Size() > lastSize {
+					f, err := os.Open(filePathPtr)
+					if err != nil {
+						log.Printf("Error reopening file: %v", err)
+						time.Sleep(1 * time.Second)
 						continue
 					}
-					log.Printf("Error reading file: %v", err)
-					return
+
+					// Jump to last read position
+					f.Seek(lastSize, io.SeekStart)
+					reader := bufio.NewReader(f)
+
+					for {
+						line, err := reader.ReadString('\n')
+						if err != nil {
+							break // EOF for now
+						}
+						if filterRegex == nil || filterRegex.MatchString(line) {
+							fmt.Print(line)
+						}
+					}
+
+					// Remember where we left off
+					pos, _ := f.Seek(0, io.SeekCurrent)
+					lastSize = pos
+					f.Close()
 				}
-				offset += int64(len(line))
-				if filterRegex == nil || filterRegex.MatchString(line) {
-					fmt.Print(line)
-				}
+
+				time.Sleep(500 * time.Millisecond)
 			}
 		}
 	}
