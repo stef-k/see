@@ -1,4 +1,4 @@
-$version   = "v1.0.1"
+$version   = "v1.0.2"
 $buildDate = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
 
 $targets = @(
