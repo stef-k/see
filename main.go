@@ -34,9 +34,12 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"regexp"
 	"sync"
 	"time"
+
+	"github.com/fsnotify/fsnotify"
 )
 
 var (
@@ -145,8 +148,10 @@ func see(ctx context.Context, wg *sync.WaitGroup, filterPtr string, filePathPtr 
 
 	defer wg.Done()
 
-	// compile regex if provided
-	var filterRegex *regexp.Regexp
+	var (
+		filterRegex *regexp.Regexp
+	)
+
 	if filterPtr != "" {
 		var err error
 		filterRegex, err = regexp.Compile(filterPtr)
@@ -165,6 +170,10 @@ func see(ctx context.Context, wg *sync.WaitGroup, filterPtr string, filePathPtr 
 	// create a scanner to read lines
 	scanner := bufio.NewScanner(file)
 
+	const maxLine = 1024 * 1024
+	buf := make([]byte, 64*1024)
+	scanner.Buffer(buf, maxLine)
+
 	// read existing lines
 	fmt.Println("Reading existing lines...")
 	for scanner.Scan() {
@@ -179,103 +188,142 @@ func see(ctx context.Context, wg *sync.WaitGroup, filterPtr string, filePathPtr 
 		return // stop the goroutine and return to main
 	}
 
+	// record current file position from the fd (authoritative)
+	// and prepare for tailing
+	pos, err := file.Seek(0, io.SeekCurrent)
+	if err != nil {
+		log.Printf("seek error: %v", err)
+		return
+	}
+	offset := pos // <-- this is our single source of truth
+
 	if tailPtr {
 		fmt.Println("Entering tail mode (Ctrl+C to stop)...")
 
-		// Start tailing from the end of what you already printed above.
-		info, err := os.Stat(filePathPtr)
-		if err != nil {
-			log.Fatalf("stat failed: %v", err)
-		}
-		lastSize := info.Size() // we already printed the file once
+		// authoritative offset from the fd (you already computed it above as `offset`)
+		// we’ll keep one carry buffer for partial lines between events
+		carry := make([]byte, 0, 4096)
 
-		// Buffer to accumulate chunks and handle partial lines at chunk edges
-		const chunkSize = 64 * 1024
-		var carry []byte
+		dir := filepath.Dir(filePathPtr)
+		base := filepath.Base(filePathPtr)
+
+		watcher, err := fsnotify.NewWatcher()
+		if err != nil {
+			log.Printf("fsnotify watcher error: %v", err)
+			return
+		}
+		defer watcher.Close()
+
+		if err := watcher.Add(dir); err != nil {
+			log.Printf("fsnotify add error: %v", err)
+			return
+		}
+
+		// helper: read exactly [offset:currentSize) and advance offset
+		readNew := func() {
+			fi, err := os.Stat(filePathPtr)
+			if err != nil {
+				// file may not exist briefly during rotation
+				return
+			}
+			cur := fi.Size()
+
+			// truncated/rotated
+			if cur < offset {
+				offset = 0
+				carry = carry[:0]
+			}
+			if cur == offset {
+				return
+			}
+
+			f, err := os.Open(filePathPtr)
+			if err != nil {
+				return
+			}
+
+			const chunk = 64 * 1024
+			buf := make([]byte, chunk)
+
+			start := offset
+			for start < cur {
+				want := cur - start
+				if want > int64(len(buf)) {
+					want = int64(len(buf))
+				}
+
+				n, rerr := f.ReadAt(buf[:want], start)
+				if n > 0 {
+					carry = append(carry, buf[:n]...)
+
+					// emit complete lines (keep partial in carry)
+					for {
+						nl := -1
+						for i := 0; i < len(carry); i++ {
+							if carry[i] == '\n' {
+								nl = i
+								break
+							}
+						}
+						if nl == -1 {
+							break
+						}
+						line := string(carry[:nl]) // strip '\n'
+						carry = carry[nl+1:]
+						if filterRegex == nil || filterRegex.MatchString(line) {
+							fmt.Println(line)
+						}
+					}
+					start += int64(n)
+				}
+				if rerr != nil && rerr != io.EOF {
+					// rotation mid-read; stop now and try next event/tick
+					break
+				}
+			}
+
+			_ = f.Close()
+			offset = cur
+		}
+
+		// safety net ticker in case some FS events are missed
+		ticker := time.NewTicker(250 * time.Millisecond)
+		defer ticker.Stop()
+
+		// immediate check in case something was appended after initial scan
+		readNew()
 
 		for {
 			select {
 			case <-ctx.Done():
 				fmt.Println("\nShutting down see")
 				return
-			default:
-				info, err := os.Stat(filePathPtr)
-				if err != nil {
-					log.Printf("stat error: %v", err)
-					time.Sleep(500 * time.Millisecond)
+
+			case evt := <-watcher.Events:
+				// only react to our file
+				if filepath.Base(evt.Name) != base {
 					continue
 				}
 
-				curSize := info.Size()
-
-				// Truncated or rotated (size shrank)
-				if curSize < lastSize {
-					lastSize = 0
-					carry = carry[:0]
+				// writes & flushes
+				if evt.Op&(fsnotify.Write|fsnotify.Chmod) != 0 {
+					readNew()
+					continue
 				}
 
-				// Grew: read exactly the new bytes [lastSize, curSize)
-				if curSize > lastSize {
-					f, err := os.Open(filePathPtr)
-					if err != nil {
-						log.Printf("open error: %v", err)
-						time.Sleep(500 * time.Millisecond)
-						continue
-					}
-
-					// Read in fixed-size chunks with ReadAt to avoid fd-position races
-					offset := lastSize
-					buf := make([]byte, chunkSize)
-
-					for offset < curSize {
-						// how much to read in this iteration
-						toRead := int64(len(buf))
-						remaining := curSize - offset
-						if remaining < toRead {
-							toRead = remaining
-						}
-
-						n, rerr := f.ReadAt(buf[:toRead], offset)
-						if n > 0 {
-							// Append to carry, then split by '\n'
-							carry = append(carry, buf[:n]...)
-							// Process complete lines
-							for {
-								idx := -1
-								for i := 0; i < len(carry); i++ {
-									if carry[i] == '\n' {
-										idx = i
-										break
-									}
-								}
-								if idx == -1 {
-									break
-								}
-								line := string(carry[:idx]) // without '\n'
-								carry = carry[idx+1:]
-
-								if filterRegex == nil || filterRegex.MatchString(line) {
-									fmt.Println(line)
-								}
-							}
-							offset += int64(n)
-						}
-						if rerr != nil {
-							// For regular files, ReadAt returns an error only at EOF or real errors.
-							if rerr != io.EOF {
-								log.Printf("read error: %v", rerr)
-							}
-							break
-						}
-					}
-					f.Close()
-
-					// Update lastSize to what we actually consumed
-					lastSize = curSize
+				// rotation or truncate+recreate
+				if evt.Op&(fsnotify.Rename|fsnotify.Remove|fsnotify.Create) != 0 {
+					// small delay to let the new file appear
+					time.Sleep(80 * time.Millisecond)
+					readNew()
+					continue
 				}
 
-				// Polling interval; lower for snappier tailing
-				time.Sleep(200 * time.Millisecond)
+				// default: try a read
+				readNew()
+
+			case <-ticker.C:
+				readNew()
 			}
 		}
 	}

@@ -31,13 +31,16 @@ foreach ($t in $targets) {
     go build -ldflags "-X main.version=$version -X main.buildDate=$buildDate" -o $binary
 
     if (Test-Path $zipName) { Remove-Item $zipName -Force }
+    if (Test-Path $binary) {
     Compress-Archive -Path $binary -DestinationPath $zipName -Force
 
-    Remove-Item $binary -Force
+    if (Test-Path $binary) {  Remove-Item $binary -Force }
+    Write-Host "`n✅ Build complete! Each platform build is zipped separately."
+    } else {
+        Write-Host "`n Nothing to build."
+    }
 }
 
 # Restore env vars
 $env:GOOS   = $oldGOOS
 $env:GOARCH = $oldGOARCH
-
-Write-Host "`n✅ Build complete! Each platform build is zipped separately."
