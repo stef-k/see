@@ -29,6 +29,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -53,28 +54,30 @@ func main() {
 		fmt.Fprintln(os.Stderr, `
 Positional args:
   <file>     Path to a file. You can use -file instead.
-  [filter]   Optional Go/RE2 regex (raw). You can use -filter instead.
-             Tip: (?i) makes your pattern case-insensitive.
+  [filter]   Optional Go/RE2 regex. You can use -filter instead.
+             Tip: use (?i) for case-insensitive; ^ and $ to anchor.
 
 Behavior:
-  • Default: prints all lines (filtered if filter provided).
+  • Default: prints all lines (filtered if a filter is provided).
   • -t               Follow new lines (like tail -f). Handles truncate/rotate.
-  • -ns N            Print first N matching lines (then -t can follow).
-  • -ne N            Print last  N matching lines (then -t can follow).
-  • Coloring: auto on TTY, off when piped or NO_COLOR/TERM=dumb.
-    - Log levels (INFO/WARN/ERROR etc., case-insensitive) are colorized.
-    - Timestamps, URLs, IPs, paths, numbers highlighted.
-    - JSON/YAML lines: keys colored; braces/commas lightly dimmed.
-    - Filter matches are highlighted distinctly and override other colors.
+  • -ns N            Print first N matching lines; can combine with -t to follow.
+  • -ne N            Print last  N matching lines; can combine with -t to follow.
+  • -ns and -ne are mutually exclusive.
+  • Flags may also appear after <file> (e.g., "... /var/log/app.log -ne 100 -t").
+
+Coloring:
+  • Auto on TTY, off when piped or NO_COLOR/TERM=dumb.
+  • Levels (INFO/WARN/ERROR etc.), timestamps, URLs, IPs, paths, numbers highlighted.
+  • JSON/YAML keys subtly colored; punctuation dimmed.
+  • Filter matches are highlighted and override generic coloring.
 
 Examples:
-  see logfile.txt
-  see logfile.txt "(?i)error"
-  see logfile.txt "^WARN" -t
-  see -file /var/log/nginx/access.log -filter "GET /api" -ne 200 -t
+  see /var/log/nginx/access.log "(?i)error"
+  see -file /var/log/nginx/access.log -filter "^WARN" -t
+  see /var/log/nginx/access.log -ne 200 -t
 
 Notes:
-  • Regex syntax is Go's RE2 (no lookbehind). Use anchors ^ and $, groups, (?i), etc.
+  • Regex syntax is Go's RE2 (no lookbehind).
   • Directory rotation (logrotate) is followed automatically.
   • Exit with Ctrl+C while tailing.`)
 	}
@@ -86,6 +89,7 @@ Notes:
 	tailPtr := flag.Bool("t", false, "Tail (follow) appended lines")
 	nsPtr := flag.Int("ns", 0, "Print first N matching lines from start")
 	nePtr := flag.Int("ne", 0, "Print last N matching lines from end")
+
 	flag.Parse()
 
 	if *versionFlag {
@@ -94,12 +98,65 @@ Notes:
 	}
 
 	// Positional args
+	// after: flag.Parse()
 	args := flag.Args()
-	for _, a := range args {
-		if a == "-t" || a == "--t" {
+
+	// --- Post-parse sweep so flags after <file> also work ---
+	for i := 0; i < len(args); i++ {
+		tok := args[i]
+
+		// -t / --t
+		if tok == "-t" || tok == "--t" {
 			*tailPtr = true
+			// mark consumed
+			args[i] = ""
+			continue
+		}
+
+		// -ns=N or -ns N
+		if strings.HasPrefix(tok, "-ns=") {
+			if v, err := strconv.Atoi(tok[len("-ns="):]); err == nil {
+				*nsPtr = v
+			}
+			args[i] = ""
+			continue
+		}
+		if tok == "-ns" && i+1 < len(args) {
+			if v, err := strconv.Atoi(args[i+1]); err == nil {
+				*nsPtr = v
+				args[i], args[i+1] = "", "" // consume both
+				i++
+				continue
+			}
+		}
+
+		// -ne=N or -ne N
+		if strings.HasPrefix(tok, "-ne=") {
+			if v, err := strconv.Atoi(tok[len("-ne="):]); err == nil {
+				*nePtr = v
+			}
+			args[i] = ""
+			continue
+		}
+		if tok == "-ne" && i+1 < len(args) {
+			if v, err := strconv.Atoi(args[i+1]); err == nil {
+				*nePtr = v
+				args[i], args[i+1] = "", "" // consume both
+				i++
+				continue
+			}
 		}
 	}
+
+	// Now resolve <file> and optional [filter] from remaining args (skipping consumed slots)
+	clean := args[:0]
+	for _, a := range args {
+		if a != "" {
+			clean = append(clean, a)
+		}
+	}
+	args = clean
+
 	if *filePathPtr == "" {
 		if len(args) > 0 {
 			*filePathPtr = args[0]
@@ -110,6 +167,11 @@ Notes:
 	}
 	if *filterPtr == "" && len(args) > 0 {
 		*filterPtr = args[0]
+	}
+
+	// Enforce mutual exclusion after the sweep
+	if *nsPtr > 0 && *nePtr > 0 {
+		log.Fatalf("Use either -ns or -ne, not both")
 	}
 
 	// Pre-check
@@ -346,108 +408,87 @@ func printLastNFiltered(path string, rx *regexp.Regexp, n int, enableColor bool)
 	return size, nil
 }
 
-// see: initial print + fsnotify-based follow
 func see(ctx context.Context, wg *sync.WaitGroup, filterPtr, filePathPtr string, tailPtr bool, ns, ne int) {
 	defer wg.Done()
 
-	// Compile regex
-	var filterRegex *regexp.Regexp
+	// Compile filter strictly as Go/RE2 regex (no modes)
+	var rx *regexp.Regexp
 	if filterPtr != "" {
-		var err error
-		filterRegex, err = regexp.Compile(filterPtr)
+		rxc, err := regexp.Compile(filterPtr)
 		if err != nil {
-			log.Fatalf("Invalid regex pattern: %v", err)
+			log.Fatalf("Invalid regex pattern %q: %v", filterPtr, err)
 		}
+		rx = rxc
 	}
-
-	// Decide once whether to colorize (TTY-only)
 	enableColor := colorEnabled()
 
-	// Open once for initial print
-	file, err := os.Open(filePathPtr)
-	if err != nil {
-		log.Fatalf("Error opening file: %v", err)
-	}
+	// --- Initial print phase (head/last/all) ---
+	var offset int64
 
-	// Initial print (all | first N | last N)
-	fmt.Println("Reading existing lines...")
-
-	if ns > 0 && ne > 0 {
-		_ = file.Close()
+	switch {
+	case ns > 0 && ne > 0:
 		log.Fatalf("Use either -ns or -ne, not both")
-	}
 
-	initPrinted := 0
-
-	if ns > 0 {
-		n, err := printFirstNFiltered(filePathPtr, filterRegex, ns, enableColor)
-		if err != nil {
-			_ = file.Close()
+	case ns > 0:
+		// print first N matching
+		if _, err := printFirstNFiltered(filePathPtr, rx, ns, enableColor); err != nil {
 			log.Printf("Error: %v", err)
 			return
 		}
-		_ = file.Close()
-		initPrinted = n
-	} else if ne > 0 {
-		n, err := printLastNFiltered(filePathPtr, filterRegex, ne, enableColor)
-		if err != nil {
-			_ = file.Close()
+		// start tailing from EOF
+		if fi, err := os.Stat(filePathPtr); err == nil {
+			offset = fi.Size()
+		}
+
+	case ne > 0:
+		// print last N matching
+		if _, err := printLastNFiltered(filePathPtr, rx, ne, enableColor); err != nil {
 			log.Printf("Error: %v", err)
 			return
 		}
-		_ = file.Close()
-		initPrinted = n
-	} else {
-		// default: print all (filtered)
-		sc := bufio.NewScanner(file)
+		// start tailing from EOF
+		if fi, err := os.Stat(filePathPtr); err == nil {
+			offset = fi.Size()
+		}
+
+	default:
+		// print all (filtered), then tail from the *FD position we read to*
+		f, err := os.Open(filePathPtr)
+		if err != nil {
+			log.Fatalf("Error opening file: %v", err)
+		}
+		fmt.Println("Reading existing lines...")
+		sc := bufio.NewScanner(f)
 		const maxLine = 1024 * 1024
 		buf := make([]byte, 64*1024)
 		sc.Buffer(buf, maxLine)
 
 		for sc.Scan() {
 			line := sc.Text()
-			if filterRegex == nil || filterRegex.MatchString(line) {
-				fmt.Println(renderLine(line, filterRegex, enableColor))
-				initPrinted++
+			if rx == nil || rx.MatchString(line) {
+				fmt.Println(renderLine(line, rx, enableColor))
 			}
 		}
 		if err := sc.Err(); err != nil && err != io.EOF {
-			_ = file.Close()
+			_ = f.Close()
 			log.Printf("Error reading file: %v", err)
 			return
 		}
-		_ = file.Close()
-	}
-
-	// If not following (-t off) and a filter is set, print a tiny summary.
-	if !tailPtr && filterRegex != nil {
-		if initPrinted == 0 {
-			fmt.Println(ansiDim + "(no lines matched filter)" + ansiReset)
-		} else {
-			s := ""
-			if initPrinted != 1 {
-				s = "s"
-			}
-			fmt.Printf(ansiDim+"(matched %d line%s)"+ansiReset+"\n", initPrinted, s)
+		// authoritative position from THIS FD so we don’t miss append-during-scan
+		if pos, err := f.Seek(0, io.SeekCurrent); err == nil {
+			offset = pos
+		} else if fi, err2 := os.Stat(filePathPtr); err2 == nil {
+			offset = fi.Size()
 		}
+		_ = f.Close()
 	}
 
-	// Start following from EOF (like `tail -n … -f`)
-	fi2, e2 := os.Stat(filePathPtr)
-	if e2 != nil {
-		log.Printf("stat error: %v", e2)
-		return
-	}
-	offset := fi2.Size() // single source of truth for tail
-
+	// If no follow requested, we’re done.
 	if !tailPtr {
 		return
 	}
 
 	fmt.Println("Entering tail mode (Ctrl+C to stop)...")
-
-	// Carry buffer for partial lines between events
-	carry := make([]byte, 0, 4096)
 
 	dir := filepath.Dir(filePathPtr)
 	base := filepath.Base(filePathPtr)
@@ -459,21 +500,23 @@ func see(ctx context.Context, wg *sync.WaitGroup, filterPtr, filePathPtr string,
 	}
 	defer watcher.Close()
 
+	// watch the directory; filter by basename (works with rotation)
 	if err := watcher.Add(dir); err != nil {
 		log.Printf("fsnotify add error: %v", err)
 		return
 	}
 
-	// Read [offset:currentSize) and advance offset
+	// carry for partial line across chunks
+	carry := make([]byte, 0, 4096)
+
 	readNew := func() {
 		fi, err := os.Stat(filePathPtr)
 		if err != nil {
-			// File may not exist briefly during rotation
 			return
 		}
 		cur := fi.Size()
 
-		// Truncated/rotated
+		// truncated/rotated
 		if cur < offset {
 			offset = 0
 			carry = carry[:0]
@@ -486,6 +529,7 @@ func see(ctx context.Context, wg *sync.WaitGroup, filterPtr, filePathPtr string,
 		if err != nil {
 			return
 		}
+		defer f.Close()
 
 		const chunk = 64 * 1024
 		buf := make([]byte, chunk)
@@ -496,12 +540,9 @@ func see(ctx context.Context, wg *sync.WaitGroup, filterPtr, filePathPtr string,
 			if want > int64(len(buf)) {
 				want = int64(len(buf))
 			}
-
 			n, rerr := f.ReadAt(buf[:want], start)
 			if n > 0 {
 				carry = append(carry, buf[:n]...)
-
-				// Emit complete lines (keep partial in carry)
 				for {
 					nl := -1
 					for i := 0; i < len(carry); i++ {
@@ -513,29 +554,26 @@ func see(ctx context.Context, wg *sync.WaitGroup, filterPtr, filePathPtr string,
 					if nl == -1 {
 						break
 					}
-					line := string(carry[:nl]) // strip '\n'
+					line := string(carry[:nl])
 					carry = carry[nl+1:]
-					if filterRegex == nil || filterRegex.MatchString(line) {
-						fmt.Println(renderLine(line, filterRegex, enableColor))
+					if rx == nil || rx.MatchString(line) {
+						fmt.Println(renderLine(line, rx, enableColor))
 					}
 				}
 				start += int64(n)
 			}
 			if rerr != nil && rerr != io.EOF {
-				// Rotation mid-read; stop now and try next event/tick
-				break
+				break // rotation mid-read; next event will pick up
 			}
 		}
-
-		_ = f.Close()
 		offset = cur
 	}
 
-	// Safety net: tick in case of missed FS events
+	// Safety net ticker in case events are missed
 	ticker := time.NewTicker(250 * time.Millisecond)
 	defer ticker.Stop()
 
-	// Immediate read (covers data appended after initial scan)
+	// Catch data appended between initial print and watcher start
 	readNew()
 
 	for {
@@ -545,21 +583,21 @@ func see(ctx context.Context, wg *sync.WaitGroup, filterPtr, filePathPtr string,
 			return
 
 		case evt := <-watcher.Events:
-			// Only react to our file
 			if filepath.Base(evt.Name) != base {
 				continue
 			}
-
 			switch {
 			case evt.Op&(fsnotify.Write|fsnotify.Chmod) != 0:
 				readNew()
 			case evt.Op&(fsnotify.Rename|fsnotify.Remove|fsnotify.Create) != 0:
-				// Small delay to let the new file appear
 				time.Sleep(80 * time.Millisecond)
 				readNew()
 			default:
 				readNew()
 			}
+
+		case err := <-watcher.Errors:
+			log.Printf("fsnotify error: %v", err)
 
 		case <-ticker.C:
 			readNew()
